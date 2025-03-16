@@ -232,14 +232,17 @@ def reorganize(src: str | list[str], dest: str):
         root = Path(root).expanduser()
         idx = build_index(root)
         index.extend(idx)
+    dest_index = build_index(dest)
+    dest_hash2path = {fd.hash : fd.path for fd in dest_index}
     print("Analyzing for issues")
     issues = find_issues(index)
     duplicates = set(fd.path for _, fd in issues["duplicates"])
     collisions = set(fd.path for _, fd in issues["collisions"])
     print(f"Found {len(duplicates)} duplicates and {len(collisions)} collisions")
+    print(f"Files already in destination: {len([fd for fd in index if fd.hash in dest_hash2path])}")
     print(f"Copying to the {dest}")
     dest = os.path.expanduser(dest).rstrip("/")
-    plog = ProgressLogger("dedup-log.jsonl")
+    # plog = ProgressLogger("dedup-log.jsonl")
     for fd in tqdm(index):
         if fd.size == 0:
             continue
@@ -255,25 +258,28 @@ def reorganize(src: str | list[str], dest: str):
             maybe_album = fd.album + "/" if fd.album else ""
             base_out_path = f"{dest}/(no-date)/{maybe_album}/{fd.name}"
         out_path = maybe_increment_path(base_out_path)
-        if plog.exists(fd.path, out_path):
+        if fd.hash in dest_hash2path and base_out_path == dest_hash2path[fd.hash]:
+            # ^ note: checking against base_out_path, i.e. without `... (idx)` suffix
             continue
+        # if plog.exists(fd.path, out_path):
+        #     continue
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         copy_with_retry(fd.path, out_path)
-        plog.log(fd.path, out_path)
+        # plog.log(fd.path, out_path)
     print("Copying collisions")
     for path in collisions:
         out_base_path = f"{dest}/collisions/{os.path.basename(path)}"
         out_path = maybe_increment_path(out_base_path)
-        if plog.exists(path, out_path):
-            continue
+        # if plog.exists(path, out_path):
+        #     continue
         copy_with_retry(path, out_path)
-        plog.append(path, out_path)
+        # plog.append(path, out_path)
     print("Done!")
 
 
 def main():
-    # src = "~/ElementsBackup"
-    # dest = "/Volumes/Elements/photos"
-    src = "~/Takeout"
-    dest = "~/TakeoutReorganized"
+    src = "~/ElementsBackup"
+    dest = "/Volumes/Elements/photos"
+    # src = "~/Takeout"
+    # dest = "~/TakeoutReorganized"
     reorganize(src, dest)
