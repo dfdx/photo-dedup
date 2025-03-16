@@ -1,12 +1,13 @@
 import os
 import re
+import time
+import json
 import hashlib
 import ffmpeg
 import mimetypes
 import shutil
 from pathlib import Path
 from datetime import datetime
-from itertools import islice
 from tqdm import tqdm
 from PIL import Image, ExifTags
 
@@ -119,11 +120,10 @@ class FileDescriptor:
 
     @property
     def album(self):
-        # matches /path/to/2010/album_name/image.jpg
-        album_matched = re.search(r"/(19\d{2}|20\d{2})/(.*)/.*\..*$", self.path)
-        month_matched = re.search(r"/(19\d{2}|20\d{2})/(\d{2})/.*\..*$", self.path)
-        if album_matched and not month_matched:
-            return album_matched.groups()[-1]
+        album = os.path.basename(os.path.dirname(self.path))
+        if not re.match(r"^[0-9\-\._ ]+$", album):
+            # doesn't look like a date
+            return album
         return None
 
 
@@ -156,6 +156,7 @@ def find_issues(index: list[FileDescriptor]):
 
 
 def build_index(root: Path | str):
+    root = Path(root).expanduser()
     index = []
     pbar = tqdm(sorted(root.rglob("*")))
     for path in pbar:
@@ -185,6 +186,43 @@ def maybe_increment_path(path: str):
     return new_path
 
 
+def copy_with_retry(src, dst, n_retries=10):
+    success = False
+    while n_retries > 0 and not success:
+        try:
+            shutil.copy(src, dst)
+            success = True
+        except:
+            print(f"Failed to copy: {src} -> {dst}. Retrying in 3 seconds...")
+            time.sleep(3)
+            n_retries -= 1
+    if not success:
+        raise ValueError(f"Failed to copy {src} -> {dst} after 10 retries")
+
+
+class ProgressLogger:
+    def __init__(self, log_file: str):
+        self.log_file = log_file
+        self.records = []
+        self.record_set = set([])
+        if os.path.exists(log_file):
+            with open(log_file) as fp:
+                for line in fp:
+                    rec = json.loads(line)
+                    self.records.append(rec)
+                    self.record_set.add((rec["src"], rec["dst"]))
+
+    def exists(self, src: str, dst: str):
+        return (src, dst) in self.record_set
+
+    def log(self, src: str, dst: str):
+        rec = {"src": src, "dst": dst}
+        self.records.append(rec)
+        self.record_set.add((src, dst))
+        with open(self.log_file, "a") as fp:
+            fp.write(json.dumps(rec) + "\n")
+
+
 def reorganize(src: str | list[str], dest: str):
     if isinstance(src, str) or isinstance(src, Path):
         src = [src]
@@ -201,6 +239,7 @@ def reorganize(src: str | list[str], dest: str):
     print(f"Found {len(duplicates)} duplicates and {len(collisions)} collisions")
     print(f"Copying to the {dest}")
     dest = os.path.expanduser(dest).rstrip("/")
+    plog = ProgressLogger("dedup-log.jsonl")
     for fd in tqdm(index):
         if fd.size == 0:
             continue
@@ -213,17 +252,28 @@ def reorganize(src: str | list[str], dest: str):
             album_or_month = fd.album or str(dt.month)
             base_out_path = f"{dest}/{dt.year}/{album_or_month}/{fd.name}"
         else:
-            base_out_path = f"{dest}/(no-date)/{fd.name}"
+            maybe_album = fd.album + "/" if fd.album else ""
+            base_out_path = f"{dest}/(no-date)/{maybe_album}/{fd.name}"
         out_path = maybe_increment_path(base_out_path)
+        if plog.exists(fd.path, out_path):
+            continue
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        shutil.copy(fd.path, out_path)
+        copy_with_retry(fd.path, out_path)
+        plog.log(fd.path, out_path)
+    print("Copying collisions")
+    for path in collisions:
+        out_base_path = f"{dest}/collisions/{os.path.basename(path)}"
+        out_path = maybe_increment_path(out_base_path)
+        if plog.exists(path, out_path):
+            continue
+        copy_with_retry(path, out_path)
+        plog.append(path, out_path)
     print("Done!")
 
 
 def main():
-    src = "~/ElementsBackup"
-    # dest = "/Volumes/Elements/photos/"
-    dest = "~/ElementsTestOut"
-
-    index = build_index(src)
-    issues = find_issues(index)
+    # src = "~/ElementsBackup"
+    # dest = "/Volumes/Elements/photos"
+    src = "~/Takeout"
+    dest = "~/TakeoutReorganized"
+    reorganize(src, dest)
