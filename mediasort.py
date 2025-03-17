@@ -120,23 +120,22 @@ class FileDescriptor:
 
     @property
     def record_time(self):
-        # time from path has highest priority since somebody has already set it manually
-        dt = datetime_from_path(self.path)
-        if dt:
-            return dt
         # empty files have no metadata, so we give up on them
         if self.size == 0:
             return None
+        dt = None
         # try to extract datetime from metadata
         if self.typ == "image":
             dts = self.meta.get("DateTimeOriginal") or self.meta.get("DateTime")
-            return datetime.strptime(dts, "%Y:%m:%d %H:%M:%S") if dts else None
+            dt = datetime.strptime(dts, "%Y:%m:%d %H:%M:%S") if dts else None
         elif self.typ == "video":
             from_tag = self.meta.get("format", {}).get("tags", {}).get("creation_time")
             if from_tag and not from_tag.startswith("1970"):
-                return datetime.strptime(from_tag, "%Y-%m-%dT%H:%M:%S.%fZ")
-            return None
-        return None
+                dt = datetime.strptime(from_tag, "%Y-%m-%dT%H:%M:%S.%fZ")
+        # as a last resort, try to extract datetime from path
+        if dt is None:
+            dt = datetime_from_path(self.path)
+        return dt
 
     @property
     def album(self):
@@ -148,41 +147,8 @@ class FileDescriptor:
 
 
 ###############################################################################
-#                               find_issues                                   #
-###############################################################################
-
-def find_issues(index: list[FileDescriptor]):
-    hashes = {}
-    collisions = []
-    duplicates = []
-    empty = []
-    for fd in tqdm(index):
-        if fd.size == 0:
-            empty.append(fd)
-            continue
-        if fd.hash in hashes:
-            existing_fd = hashes[fd.hash]
-            if existing_fd.is_same(fd):
-                duplicates.append((existing_fd, fd))
-            else:
-                collisions.append((existing_fd, fd))
-        else:
-            hashes[fd.hash] = fd
-    return {
-        "collisions": collisions,
-        "duplicates": duplicates,
-        "empty": empty,
-    }
-
-
-###############################################################################
 #                                    Index                                    #
 ###############################################################################
-
-class CollisionException(Exception):
-    def __init__(self, message):
-        super().__init__(message)
-
 
 class Index:
     def __init__(self, cachefile: str | None = None, recreate=False):
@@ -191,20 +157,27 @@ class Index:
             os.remove(self.cachefile)
         self.items = []
         self.hashes = defaultdict(lambda: [])    # hash -> [fd]
-        self.paths = defaultdict(lambda: [])     # path -> fd
+        self.paths = defaultdict(lambda: [])     # path -> [fd]
         self.update_from_cache(self.cachefile)
 
     def __repr__(self):
         return f"Index(cachefile='{self.cachefile}', len={len(self.items)})"
 
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
     def update_from_cache(self, cachefile: str):
         logger.info(f"Pre-loading index from {cachefile}")
         if os.path.exists(cachefile):
             with open(cachefile) as fp:
-                for line in fp:
-                    dct = json.loads(line)
-                    fd = FileDescriptor.from_dict(dct)
-                    self.add(fd)
+                lines = fp.readlines()
+            for line in tqdm(lines):
+                dct = json.loads(line)
+                fd = FileDescriptor.from_dict(dct)
+                self.add(fd)
 
     def add(self, fd: FileDescriptor):
         existing = self.hashes[fd.hash]
@@ -272,89 +245,53 @@ def copy_with_retry(src, dst, n_retries=10):
         raise ValueError(f"Failed to copy {src} -> {dst} after 10 retries")
 
 
-# class ProgressLogger:
-#     def __init__(self, log_file: str):
-#         self.log_file = log_file
-#         self.records = []
-#         self.record_set = set([])
-#         if os.path.exists(log_file):
-#             with open(log_file) as fp:
-#                 for line in fp:
-#                     rec = json.loads(line)
-#                     self.records.append(rec)
-#                     self.record_set.add((rec["src"], rec["dst"]))
 
-#     def exists(self, src: str, dst: str):
-#         return (src, dst) in self.record_set
-
-#     def log(self, src: str, dst: str):
-#         rec = {"src": src, "dst": dst}
-#         self.records.append(rec)
-#         self.record_set.add((src, dst))
-#         with open(self.log_file, "a") as fp:
-#             fp.write(json.dumps(rec) + "\n")
+def output_path(fd: FileDescriptor, dst: str):
+    """
+    Generate (base) output path given file descriptor and destination root.
+    """
+    dt = fd.record_time
+    if dt:
+        album_or_month = fd.album or str(dt.month)
+        base_out_path = f"{dst}/{dt.year}/{album_or_month}/{fd.name}"
+    else:
+        maybe_album = fd.album + "/" if fd.album else ""
+        base_out_path = f"{dst}/(no-date)/{maybe_album}/{fd.name}"
+    return base_out_path
 
 
 def reorganize(src: str | list[str], dest: str):
     if isinstance(src, str) or isinstance(src, Path):
         src = [src]
-    print("Indexing files")
-    index = []
+    print("Indexing source")
+    index = Index()
     for root in src:
-        root = Path(root).expanduser()
-        idx = build_index(root)
-        index.extend(idx)
-    print("Analyzing for issues")
-    issues = find_issues(index)
-    duplicates = set(fd.path for _, fd in issues["duplicates"])
-    collisions = set(fd.path for _, fd in issues["collisions"])
-    print(f"Found {len(duplicates)} duplicates and {len(collisions)} collisions")
+        index.update(root)
     print("Indexing destination")
-    dest_index = build_index(dest)
-    dest_hash2path = {fd.hash : fd.path for fd in dest_index}
-    print(f"Files already in destination: {len([fd for fd in index if fd.hash in dest_hash2path])}")
+    dest_index = Index(cachefile=os.path.abspath("dest-media-index.jsonl"))
+    dest_index.update(dest)
+    print(f"Files already in destination: {len([fd for fd in index if fd.hash in dest_index.hashes])}")
     print(f"Copying to the {dest}")
     dest = os.path.expanduser(dest).rstrip("/")
-    # plog = ProgressLogger("dedup-log.jsonl")
     for fd in tqdm(index):
-        if fd.size == 0:
+        # if file is invalid or not a media, then skip
+        if fd.size == 0 or (fd.typ != "image" and fd.typ != "video"):
             continue
-        if fd.path in duplicates:
+        # if there's already such a file in the destination, then skip
+        dest_fds = dest_index.hashes[fd.hash]
+        if any(fd.is_same(dest_fd) for dest_fd in dest_fds):
             continue
-        if fd.typ != "image" and fd.typ != "video":
-            continue
-        dt = fd.record_time
-        if dt:
-            album_or_month = fd.album or str(dt.month)
-            base_out_path = f"{dest}/{dt.year}/{album_or_month}/{fd.name}"
-        else:
-            maybe_album = fd.album + "/" if fd.album else ""
-            base_out_path = f"{dest}/(no-date)/{maybe_album}/{fd.name}"
+        # otherwise, copy file
+        base_out_path = output_path(fd, dest)
         out_path = maybe_increment_path(base_out_path)
-        if fd.hash in dest_hash2path and base_out_path == dest_hash2path[fd.hash]:
-            # ^ note: checking against base_out_path, i.e. without `... (idx)` suffix
-            continue
-        # if plog.exists(fd.path, out_path):
-        #     continue
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         copy_with_retry(fd.path, out_path)
-        # plog.log(fd.path, out_path)
-    print("Copying collisions")
-    for path in collisions:
-        out_base_path = f"{dest}/collisions/{os.path.basename(path)}"
-        out_path = maybe_increment_path(out_base_path)
-        # if plog.exists(path, out_path):
-        #     continue
-        copy_with_retry(path, out_path)
-        # plog.append(path, out_path)
     print("Done!")
 
 
 def main():
     src = "~/ElementsBackup"
     dest = "/Volumes/Elements/photos"
-    # src = "~/Takeout"
-    # dest = "~/TakeoutReorganized"
+    src = "~/Takeout"
+    dest = "~/TakeoutReorganized"
     reorganize(src, dest)
-
-    # TODO: create index cache, don't re-index destination
