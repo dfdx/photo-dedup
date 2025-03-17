@@ -7,12 +7,15 @@ import ffmpeg
 import mimetypes
 import shutil
 import logging
+import base64
 from dataclasses import dataclass
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 from PIL import Image, ExifTags
+from PIL.TiffImagePlugin import IFDRational
 
 
 def get_logger():
@@ -35,6 +38,14 @@ logger = get_logger()
 ###############################################################################
 #                               FileDescriptor                                #
 ###############################################################################
+
+def exif_encoder(obj):
+    if isinstance(obj, IFDRational):
+        return float(obj)
+    elif isinstance(obj, bytes):
+        return base64.b64encode(obj).decode("utf-8")
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 
 def file_type(path: Path | str) -> str:
     mime_type, _ = mimetypes.guess_type(str(path))
@@ -187,8 +198,11 @@ class Index:
         self.items.append(fd)
         self.hashes[fd.hash].append(fd)
         self.paths[fd.path].append(fd)
-        with open(self.cachefile, "a") as fp:
-            fp.write(json.dumps(fd.__dict__) + "\n")
+        try:
+            with open(self.cachefile, "a") as fp:
+                fp.write(json.dumps(fd.__dict__, default=exif_encoder) + "\n")
+        except Exception as ex:
+            logger.warning(f"Failed to write {fd} to the cache because of {repr(ex)}")
         return True
 
     def update(self, root: Path | str):
@@ -259,6 +273,7 @@ def output_path(fd: FileDescriptor, dst: str):
         base_out_path = f"{dst}/(no-date)/{maybe_album}/{fd.name}"
     return base_out_path
 
+FD = None
 
 def reorganize(src: str | list[str], dest: str):
     if isinstance(src, str) or isinstance(src, Path):
@@ -274,6 +289,8 @@ def reorganize(src: str | list[str], dest: str):
     print(f"Copying to the {dest}")
     dest = os.path.expanduser(dest).rstrip("/")
     for fd in tqdm(index):
+        global FD
+        FD = fd
         # if file is invalid or not a media, then skip
         if fd.size == 0 or (fd.typ != "image" and fd.typ != "video"):
             continue
@@ -286,12 +303,15 @@ def reorganize(src: str | list[str], dest: str):
         out_path = maybe_increment_path(base_out_path)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         copy_with_retry(fd.path, out_path)
+        dest_fd = deepcopy(fd)
+        dest_fd.path = out_path
+        dest_index.add(dest_fd)
     print("Done!")
 
 
 def main():
     src = "~/ElementsBackup"
     dest = "/Volumes/Elements/photos"
-    src = "~/Takeout"
-    dest = "~/TakeoutReorganized"
+    # src = "~/Takeout"
+    # dest = "~/TakeoutReorganized"
     reorganize(src, dest)
