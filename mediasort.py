@@ -76,7 +76,7 @@ def datetime_from_path(path: str):
     # covers:
     # /path/to/2010/05/image.jpg
     # /path/to/2010/subdir/image.jpg
-    matched = re.search(r".*/(19\d{2}|20\d{2})/(\d{2}/)?", path)
+    matched = re.search(r".*/(19\d{2}|20\d{2})/(\d{1,2}/)?", path)
     if matched:
         year_str, month_str = matched.groups()
         year = int(year_str)
@@ -125,9 +125,12 @@ class FileDescriptor:
         return self._meta
 
     def is_same(self, other):
-        self_dt = self.record_time or datetime(1, 1, 1)
-        other_dt = other.record_time or datetime(1, 1, 1)
-        return self.hash == other.hash and self_dt.year == other_dt.year and self_dt.month == other_dt.month
+        # in practice, I haven't found any collisions even with the hash itself
+        # for just in case let's also check the file size
+        return self.hash == other.hash and self.size == other.size
+        # self_dt = self.record_time or datetime(1, 1, 1)
+        # other_dt = other.record_time or datetime(1, 1, 1)
+        # return self.hash == other.hash and self_dt.year == other_dt.year and self_dt.month == other_dt.month
 
     @property
     def record_time(self):
@@ -179,6 +182,9 @@ class Index:
 
     def __len__(self):
         return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
 
     def update_from_cache(self, cachefile: str):
         logger.info(f"Pre-loading index from {cachefile}")
@@ -259,21 +265,19 @@ def copy_with_retry(src, dst, n_retries=10):
         raise ValueError(f"Failed to copy {src} -> {dst} after 10 retries")
 
 
-
 def output_path(fd: FileDescriptor, dst: str):
     """
     Generate (base) output path given file descriptor and destination root.
     """
     dt = fd.record_time
     if dt:
-        album_or_month = fd.album or str(dt.month)
+        album_or_month = fd.album or str(dt.month).rjust(2, "0")
         base_out_path = f"{dst}/{dt.year}/{album_or_month}/{fd.name}"
     else:
         maybe_album = fd.album + "/" if fd.album else ""
         base_out_path = f"{dst}/(no-date)/{maybe_album}/{fd.name}"
     return base_out_path
 
-FD = None
 
 def reorganize(src: str | list[str], dest: str):
     if isinstance(src, str) or isinstance(src, Path):
@@ -289,8 +293,6 @@ def reorganize(src: str | list[str], dest: str):
     print(f"Copying to the {dest}")
     dest = os.path.expanduser(dest).rstrip("/")
     for fd in tqdm(index):
-        global FD
-        FD = fd
         # if file is invalid or not a media, then skip
         if fd.size == 0 or (fd.typ != "image" and fd.typ != "video"):
             continue
@@ -315,3 +317,22 @@ def main():
     # src = "~/Takeout"
     # dest = "~/TakeoutReorganized"
     reorganize(src, dest)
+
+    # dot_clean -v $dest
+
+
+    dest = "/Volumes/Elements/photos/2019/7"
+    index = Index(cachefile="test.jsonl")
+    index.update(dest)
+
+    out = set([])
+    for h, fds in tqdm(index.hashes.items()):
+        for i in range(len(fds) - 1):
+            for j in range(i + 1, len(fds)):
+                # print(f"i = {i}; j = {j}")
+                if not fds[i].is_same(fds[j]):
+                    print(f"fds[{i}] != fds[{j}]")
+                    out.add(h)
+    for h in out:
+        print(index.hashes[h])
+        print()
